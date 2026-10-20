@@ -16,3 +16,9 @@ dbt/logs/
 .env
 .env.*
 !.env.example
+
+# python
+.env
+.venv/
+__pycache__/
+*.pyc
