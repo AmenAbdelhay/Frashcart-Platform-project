@@ -1,20 +1,19 @@
-"""Load supplier stock files (source_files/suppliers/<supplier>/*.csv) into bronze_suppliers.
+"""
+Load supplier CSV files (source_files/suppliers/<supplier>/*.csv) into bronze_suppliers.
 
-  fresh/fresh_stock_YYYY-MM-DD.csv     -> bronze_suppliers.fresh
-  general/GENERAL_STOCK_YYYYMMDD.csv   -> bronze_suppliers.general
+  fresh/*.csv   -> bronze_suppliers.fresh
+  general/*.csv -> bronze_suppliers.general
 
-The two suppliers use different formats, so each has its own table; columns are taken
-from each file's own header and stored as TEXT exactly as received (raw bronze).
+How it works (simple):
+  - Every file is tracked in a ledger table (file_path + file_hash).
+  - NEW file      -> load it.
+  - CHANGED file  -> (same name, different content) delete its old rows, load the new ones.
+  - SAME file     -> skip.
+  So late files are still picked up, and nothing is ever duplicated.
+  Rows + ledger entry are saved in ONE transaction (no half-loaded files).
 
-Rule: load each file once; late files must still be loaded.
-We never filter by date / modified time / "latest file". A ledger table
-(bronze_suppliers.etl_loaded_files) records every file loaded; each run loads every file
-on disk that is NOT in the ledger - so a GENERAL file that shows up the next morning
-(or any day later) is picked up on the next run, and nothing is ever loaded twice.
-Rows + ledger entry are committed in one transaction (no half-loaded files).
-
-Extra columns on every row: _source_file, _file_hash, _stock_date (parsed from the
-file name = the day the stock snapshot is for), _loaded_at.
+All values are stored as TEXT exactly as received, plus 4 extra columns:
+  _source_file, _file_hash, _stock_date (date taken from the file name), _loaded_at
 """
 import csv
 import datetime
@@ -47,11 +46,12 @@ WAREHOUSE = {
 SUPPLIERS_DIR = Path(os.getenv("SUPPLIERS_DIR", ROOT / "source_files" / "suppliers"))
 SCHEMA = "bronze_suppliers"
 LEDGER = "etl_loaded_files"
-META = ["_source_file", "_file_hash", "_stock_date"]
+META_COLS = ["_source_file", "_file_hash", "_stock_date"]
 
 
+# ---------------------------------------------------------------- helpers
 def stock_date(name):
-    """2026-10-17 (fresh) or 20261017 (general) in the file name -> date, else None."""
+    """Find 2026-10-17 or 20261017 in the file name. Returns a date or None."""
     m = re.search(r"(\d{4})-(\d{2})-(\d{2})|(\d{4})(\d{2})(\d{2})", name)
     if not m:
         return None
@@ -62,32 +62,6 @@ def stock_date(name):
         return None
 
 
-def read_csv(path):
-    """-> (columns, rows). Detects encoding and delimiter; every value stays a string."""
-    raw = path.read_bytes()
-    try:
-        text = raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        text = raw.decode("cp1252")
-
-    first = text.split("\n", 1)[0]
-    delimiter = max([",", ";", "\t", "|"], key=first.count)
-
-    data = [r for r in csv.reader(io.StringIO(text, newline=""), delimiter=delimiter) if r]
-    if not data:
-        return [], []
-    header, rows = data[0], data[1:]
-    width = max([len(header)] + [len(r) for r in rows])
-    header = [(h.strip() or f"col_{i + 1}") for i, h in enumerate(header)] + \
-             [f"col_{i + 1}" for i in range(len(header), width)]
-    seen = {}
-    for i, h in enumerate(header):  # repeated header names -> name_2, name_3 ...
-        seen[h] = seen.get(h, 0) + 1
-        if seen[h] > 1:
-            header[i] = f"{h}_{seen[h]}"
-    return header, [r + [None] * (width - len(r)) for r in rows]
-
-
 def file_hash(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -96,18 +70,50 @@ def file_hash(path):
     return h.hexdigest()
 
 
-def table_name(folder):
-    return re.sub(r"\W+", "_", folder.lower()).strip("_") or "files"
+def read_csv(path):
+    """Return (columns, rows). Detects encoding + delimiter. Values stay strings."""
+    raw = path.read_bytes()
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("cp1252")
+
+    first_line = text.split("\n", 1)[0]
+    delimiter = max([",", ";", "\t", "|"], key=first_line.count)
+
+    data = [r for r in csv.reader(io.StringIO(text, newline=""), delimiter=delimiter) if r]
+    if not data:
+        return [], []
+
+    header, rows = data[0], data[1:]
+    width = max([len(header)] + [len(r) for r in rows])
+
+    # clean header: empty -> col_N, repeated -> name_2, name_3 ...
+    cols = [(h.strip() or f"col_{i + 1}") for i, h in enumerate(header)]
+    cols += [f"col_{i + 1}" for i in range(len(cols), width)]
+    seen = {}
+    for i, c in enumerate(cols):
+        seen[c] = seen.get(c, 0) + 1
+        if seen[c] > 1:
+            cols[i] = f"{c}_{seen[c]}"
+
+    rows = [r + [None] * (width - len(r)) for r in rows]  # pad short rows
+    return cols, rows
 
 
+# ---------------------------------------------------------------- load one file
 def load_file(wh, table, rel_path, path):
     cols, rows = read_csv(path)
-    digest, day = file_hash(path), stock_date(path.name)
+    digest = file_hash(path)
+    day = stock_date(path.name)
     if day is None:
-        logging.warning("%s: no date found in file name - _stock_date will be NULL", rel_path)
+        logging.warning("%s: no date in file name - _stock_date will be NULL", rel_path)
+
     target = sql.SQL("{}.{}").format(sql.Identifier(SCHEMA), sql.Identifier(table))
+    ledger = sql.SQL("{}.{}").format(sql.Identifier(SCHEMA), sql.Identifier(LEDGER))
 
     with wh.cursor() as cur:
+        # 1) make sure the table exists and has every column of this file
         cur.execute(sql.SQL("""
             CREATE TABLE IF NOT EXISTS {} (
                 _source_file TEXT, _file_hash TEXT, _stock_date DATE,
@@ -116,28 +122,39 @@ def load_file(wh, table, rel_path, path):
         cur.execute("SELECT column_name FROM information_schema.columns "
                     "WHERE table_schema = %s AND table_name = %s", (SCHEMA, table))
         existing = {r[0] for r in cur.fetchall()}
-        for c in cols:  # a later file with extra columns -> columns are added, never dropped
+        for c in cols:
             if c not in existing:
                 cur.execute(sql.SQL("ALTER TABLE {} ADD COLUMN {} TEXT").format(target, sql.Identifier(c)))
 
+        # 2) remove the old version of this file (nothing to remove for a new file)
+        cur.execute(sql.SQL("DELETE FROM {} WHERE _source_file = %s").format(target), (rel_path,))
+
+        # 3) insert the rows with COPY (fast)
         if rows:
             with tempfile.TemporaryFile("w+", newline="", encoding="utf-8") as buf:
-                w = csv.writer(buf)
+                writer = csv.writer(buf)
                 for r in rows:
-                    w.writerow([rel_path, digest, day] + r)
+                    writer.writerow([rel_path, digest, day] + r)
                 buf.seek(0)
-                cur.copy_expert(
-                    sql.SQL("COPY {} ({}) FROM STDIN WITH (FORMAT csv)").format(
-                        target, sql.SQL(", ").join(map(sql.Identifier, META + cols))
-                    ).as_string(wh), buf)
+                copy_sql = sql.SQL("COPY {} ({}) FROM STDIN WITH (FORMAT csv)").format(
+                    target, sql.SQL(", ").join(map(sql.Identifier, META_COLS + cols)))
+                cur.copy_expert(copy_sql.as_string(wh), buf)
 
-        cur.execute(sql.SQL("INSERT INTO {}.{} (file_path, table_name, file_hash, row_count) "
-                            "VALUES (%s, %s, %s, %s)").format(sql.Identifier(SCHEMA), sql.Identifier(LEDGER)),
-                    (rel_path, table, digest, len(rows)))
-    wh.commit()  # rows + ledger entry together
+        # 4) record the file in the ledger (insert, or update if the file changed)
+        cur.execute(sql.SQL("""
+            INSERT INTO {} (file_path, table_name, file_hash, row_count)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (file_path) DO UPDATE
+               SET file_hash = EXCLUDED.file_hash,
+                   row_count = EXCLUDED.row_count,
+                   loaded_at = now()
+        """).format(ledger), (rel_path, table, digest, len(rows)))
+
+    wh.commit()  # rows + ledger together
     return len(rows)
 
 
+# ---------------------------------------------------------------- main
 def main():
     if not WAREHOUSE["password"]:
         raise ValueError("Missing WAREHOUSE_PASSWORD in .env")
@@ -145,7 +162,8 @@ def main():
         raise FileNotFoundError(f"Suppliers folder not found: {SUPPLIERS_DIR}")
 
     wh = psycopg2.connect(**WAREHOUSE, connect_timeout=10)
-    errors = new_files = 0
+    new_count = changed_count = errors = 0
+
     try:
         with wh.cursor() as cur:
             cur.execute("SELECT pg_advisory_lock(hashtext('load_suppliers'))")  # no parallel runs
@@ -157,27 +175,35 @@ def main():
             """).format(sql.Identifier(SCHEMA), sql.Identifier(LEDGER)))
             cur.execute(sql.SQL("SELECT file_path, file_hash FROM {}.{}").format(
                 sql.Identifier(SCHEMA), sql.Identifier(LEDGER)))
-            loaded = dict(cur.fetchall())
+            loaded = dict(cur.fetchall())  # {file_path: hash}
         wh.commit()
 
         for folder in sorted(p for p in SUPPLIERS_DIR.iterdir() if p.is_dir()):
-            files = sorted(p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() == ".csv")
-            for path in files:
+            table = re.sub(r"\W+", "_", folder.name.lower()).strip("_") or "files"
+
+            for path in sorted(p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() == ".csv"):
                 rel = path.relative_to(SUPPLIERS_DIR).as_posix()
-                if rel in loaded:
-                    if file_hash(path) != loaded[rel]:
-                        logging.warning("%s changed after it was loaded - NOT reloaded (load-once rule)", rel)
-                    continue
+
+                if rel not in loaded:
+                    status = "new"
+                elif file_hash(path) != loaded[rel]:
+                    status = "changed"
+                else:
+                    continue  # already loaded, same content
+
                 try:
-                    n = load_file(wh, table_name(folder.name), rel, path)
-                    new_files += 1
-                    logging.info("Loaded %s (%s rows) -> %s.%s", rel, n, SCHEMA, table_name(folder.name))
+                    n = load_file(wh, table, rel, path)
+                    if status == "new":
+                        new_count += 1
+                    else:
+                        changed_count += 1
+                    logging.info("%s file %s: %s rows -> %s.%s", status.upper(), rel, n, SCHEMA, table)
                 except Exception:
                     wh.rollback()
                     errors += 1
                     logging.exception("Failed loading %s (will retry next run)", rel)
 
-        logging.info("Done. %s new file(s) loaded, %s failed.", new_files, errors)
+        logging.info("Done. new=%s | changed=%s | failed=%s", new_count, changed_count, errors)
     finally:
         wh.close()
 
