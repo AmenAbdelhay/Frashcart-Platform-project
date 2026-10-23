@@ -1,0 +1,12 @@
+freshcart_dbt:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: warehouse
+      user: fresh_wh
+      password: fresh_password
+      port: 5432
+      dbname: postgres
+      schema: silver
+      threads: 1

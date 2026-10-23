@@ -83,31 +83,20 @@ services:
     volumes:
       - wh_data:/var/lib/postgresql/data
 
-
-  loaders:
+  dbt:
     build:
-      context: .
+      context: ./dbt
       dockerfile: Dockerfile
-    container_name: freshcart-loaders
+    container_name: freshcart-dbt
+    working_dir: /usr/app/freshcart_dbt
     command: ["tail", "-f", "/dev/null"]
-    env_file:
-      - .env
-    environment:
-      PROD_HOST: source-db
-      PROD_PORT: "5432"
-      WAREHOUSE_HOST: warehouse
-      WAREHOUSE_PORT: "5432"
-    depends_on:
-      source-db:
-        condition: service_healthy
-      warehouse:
-        condition: service_started
     volumes:
-      - ./source_files/suppliers:/data/suppliers:ro
-
-
-
+      - ./dbt/freshcart_dbt:/usr/app/freshcart_dbt
+      - ./dbt/profiles:/root/.dbt:ro
+    depends_on:
+      - warehouse
 
 volumes:
   source_db_data:
   wh_data:
+

@@ -1,0 +1,24 @@
+version: 2
+
+sources:
+  - name: freshcart
+    schema: bronze_app
+    tables:
+      - name: stores
+      - name: customers
+      - name: products
+      - name: product_prices
+      - name: payments
+      - name: order_items
+      - name: orders
+
+  - name: suppliers
+    schema: bronze_suppliers
+    tables:
+      - name: fresh
+      - name: general
+
+  - name: fx
+    schema: bronze_fx
+    tables:
+      - name: fx_rates
